@@ -883,4 +883,123 @@ object JdbcUtils extends Logging {
       statement.close()
     }
   }
+
+  /**
+   * DataStreams DI Team custom spark.
+   * connect DBMS get RowID min, max value.
+   */
+  def getMinMaxValues(
+      conn: Connection,
+      column: String,
+      options: JDBCOptions): (String, String) = {
+    val dialect = JdbcDialects.get(options.url)
+    val table = options.tableOrQuery
+    val sql = dialect.getMinMaxQuery(table, column)
+
+    val statement = conn.createStatement
+    try {
+      statement.setQueryTimeout(options.queryTimeout)
+      val result = statement.executeQuery(sql)
+      result.next()
+      val min = result.getString(1)
+      val max = result.getString(2)
+      result.close()
+      (min, max)
+    } catch {
+      case e: SQLException =>
+        logError(s"Fail to get Min, Max of $column.")
+        throw e
+    } finally {
+      statement.close()
+    }
+  }
+
+  def getSampleRowsAndPartition(
+      column: String,
+      options: JDBCOptions,
+      partNum: Long): ListBuffer[String] = {
+    val conn = JdbcUtils.createConnectionFactory(options)()
+
+    val table = options.tableOrQuery
+    val partList = ListBuffer[String]()
+    val samples = ListBuffer[String]()
+    val statement = conn.createStatement
+    try {
+      statement.setQueryTimeout(options.queryTimeout)
+      val limit = partNum * 2000
+      val result = statement.executeQuery(
+        s"select $column from $table order by random() limit $limit")
+      while (result.next()) {
+        samples += result.getString(1)
+      }
+      var cnt = 0
+      samples.sorted.foreach(sample => {
+        cnt += 1
+        if (cnt >= 2000) {
+          partList += sample
+        }
+      })
+      partList
+    } catch {
+      case e: SQLException =>
+        logError(s"Fail")
+        throw e
+    } finally {
+      statement.close()
+    }
+  }
+
+//  def getHighCardinalityColumnWithPrimaryKey(
+//      conn: Connection,
+//      options: JDBCOptions): String = {
+//    // if table is query, cannot find pk
+//    val dialect = JdbcDialects.get(options.url)
+//    val table = options.tableOrQuery
+//    val colList = ArrayBuffer[String]()
+//
+//    val meta = conn.getMetaData
+//    val PrimaryKeyRs = meta.getPrimaryKeys(null, null, table)
+//
+//    while (PrimaryKeyRs.next()) {
+//      colList += PrimaryKeyRs.getString(1)
+//    }
+//
+//    // this table doesn't have pk, use all columns
+//    if (colList.isEmpty) {
+//      val rs = conn
+//        .createStatement()
+//        .executeQuery(dialect.getSchemaQuery(table))
+//      val rsmd = rs.getMetaData
+//      val colCount = rsmd.getColumnCount
+//      for(i <- 1 to colCount) {
+//        colList += rsmd.getColumnName(i)
+//      }
+//    }
+//
+//    val cardinalityCount = colList
+//      .map(s => s"COUNT(distinct($s)) as $s")
+//      .mkString(", ")
+//
+//    val rs = conn
+//      .createStatement()
+//      .executeQuery(s"SELECT $cardinalityCount FROM $table")
+//    val rsmd = rs.getMetaData
+//    val colCount = rsmd.getColumnCount
+//    var maxCardinality = 0
+//    var maxCardinalityIndex = 0
+//
+//    // 여기 수정하기
+//    while (rs.next()) {
+//      for (i <- 1 to colCount) {
+//        max = if (maxCardinality > max) {
+//          maxCardinalityIndex = i
+//          maxCardinality
+//        } else {
+//          max
+//        }
+//      }
+//    }
+//
+//    colList(maxCardinalityIndex)
+//  }
 }

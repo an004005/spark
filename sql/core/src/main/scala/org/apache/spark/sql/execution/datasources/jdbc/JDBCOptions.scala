@@ -187,6 +187,28 @@ class JDBCOptions(
 
   // An option to allow/disallow pushing down predicate into JDBC data source
   val pushDownPredicate = parameters.getOrElse(JDBC_PUSHDOWN_PREDICATE, "true").toBoolean
+
+  // DataStreams DI Team custom spark.
+  val useParallel = parameters.getOrElse(JDBC_USE_PARALLEL, "false").toBoolean
+//  require(!useParallel || (useParallel && numPartitions.isDefined),
+//    s"""
+//       |Options '$JDBC_NUM_PARTITIONS' not be specified.
+//       |use `$JDBC_USE_PARALLEL` option is true.
+//       |Please define the `$JDBC_NUM_PARTITIONS` option.
+//       |Example :
+//       |spark.read.format("jdbc")
+//       |  .option("url", jdbcUrl)
+//       |  .option("dbtable", "(select c1, c2 from t1) as subq")
+//       |  .option("numPartitions", "3")
+//       |  .option("useParallel", "true")
+//       |  .load()
+//     """.stripMargin
+//  )
+
+  // DataStreams DI Team custom spark. When this option set,
+  // spark allways using this value as create table DDL
+  val literalTable: Option[String] = parameters.get(JDBC_CREATE_LITERAL_TABLE)
+  val optimizePartition = parameters.getOrElse(JDBC_OPTIMIZE_PARTITION, "false").toBoolean
 }
 
 class JdbcOptionsInWrite(
@@ -239,4 +261,9 @@ object JDBCOptions {
   val JDBC_TXN_ISOLATION_LEVEL = newOption("isolationLevel")
   val JDBC_SESSION_INIT_STATEMENT = newOption("sessionInitStatement")
   val JDBC_PUSHDOWN_PREDICATE = newOption("pushDownPredicate")
+
+  // DataStreams DI Team custom spark.
+  val JDBC_USE_PARALLEL = newOption("useParallel")
+  val JDBC_OPTIMIZE_PARTITION = newOption("optimizePartition")
+  val JDBC_CREATE_LITERAL_TABLE = newOption("literalTable")
 }

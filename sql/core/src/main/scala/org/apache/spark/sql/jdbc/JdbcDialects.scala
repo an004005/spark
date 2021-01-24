@@ -180,6 +180,39 @@ abstract class JdbcDialect extends Serializable {
    * None: The behavior of TRUNCATE TABLE is unknown (default).
    */
   def isCascadingTruncateTable(): Option[Boolean] = None
+
+  /**
+   * DataStreams DI Team custom spark, Check DB support unique identify pseudoColumn
+   *
+   * @return pseudocolumn's name
+   */
+  def supportedPseudoColumn(): Option[String] = None
+
+  /**
+   * DataStreams DI Team custom spark.
+   * Each DBMS has a different way of using the RowID,
+   * and needed RowID min, max
+   * so it should be overwritten.
+   * default is 'h2' db.
+   */
+  def getMinMaxQuery(table: String, column: String): String = {
+    // Use subquery input form `( subquery )`
+    s"SELECT MIN($column), MAX($column) FROM $table"
+  }
+
+  /**
+   * DataStreams DI Team custom spark.
+   * Each DBMS has a different way of using the RowID,
+   * so it should be overwritten.
+   * default is 'h2' db.
+   * if supportedPseudoColumn is overried, this method must overrided.
+   */
+  def getPseudoColumnWhereClause(
+      lowerBound: String,
+      upperBound: String,
+      numPartitions: Int,
+      partitionIndex: Int): String = ""
+
 }
 
 /**

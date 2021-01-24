@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.execution.datasources.jdbc
 
+import org.apache.spark.Partition
 import org.apache.spark.sql.{AnalysisException, DataFrame, SaveMode, SQLContext}
 import org.apache.spark.sql.execution.datasources.jdbc.JdbcUtils._
 import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider, DataSourceRegister, RelationProvider}
@@ -33,8 +34,14 @@ class JdbcRelationProvider extends CreatableRelationProvider
     val resolver = sqlContext.conf.resolver
     val timeZoneId = sqlContext.conf.sessionLocalTimeZone
     val schema = JDBCRelation.getSchema(resolver, jdbcOptions)
-    val parts = JDBCRelation.columnPartition(schema, resolver, timeZoneId, jdbcOptions)
-    JDBCRelation(schema, parts, jdbcOptions)(sqlContext.sparkSession)
+    if (jdbcOptions.useParallel) {
+      // DataStreams DI Team custom spark.
+      val parts = JDBCRelation.autoColumnPartition(schema, resolver, timeZoneId, jdbcOptions)
+      JDBCRelation(schema, parts, jdbcOptions)(sqlContext.sparkSession)
+    } else {
+      val parts = JDBCRelation.columnPartition(schema, resolver, timeZoneId, jdbcOptions)
+      JDBCRelation(schema, parts, jdbcOptions)(sqlContext.sparkSession)
+    }
   }
 
   override def createRelation(

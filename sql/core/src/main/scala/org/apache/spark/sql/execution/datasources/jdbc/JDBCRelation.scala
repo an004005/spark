@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.execution.datasources.jdbc
 
+import java.sql.Connection
+
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.Partition
@@ -26,21 +28,47 @@ import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SaveMode, SparkS
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.util.{DateFormatter, DateTimeUtils, TimestampFormatter}
 import org.apache.spark.sql.catalyst.util.DateTimeUtils.{getZoneId, stringToDate, stringToTimestamp}
+import org.apache.spark.sql.catalyst.util.StringUtils.{bigDecimalToString, getCommonPrefixLen, stringToBigDecimal, tryDivide}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.jdbc.JdbcDialects
 import org.apache.spark.sql.sources._
-import org.apache.spark.sql.types.{DataType, DateType, NumericType, StructType, TimestampType}
+import org.apache.spark.sql.types.{DataType, DateType, NumericType, StringType, StructType, TimestampType}
 import org.apache.spark.unsafe.types.UTF8String
 
 /**
  * Instructions on how to partition the table among workers.
  */
-private[sql] case class JDBCPartitioningInfo(
-    column: String,
-    columnType: DataType,
-    lowerBound: Long,
-    upperBound: Long,
-    numPartitions: Int)
+sealed abstract class JDBCPartitioningInfo[T] {
+    val column: String
+    val columnType: DataType
+    val lowerBound: T
+    val upperBound: T
+    val numPartitions: Int
+}
+
+private[sql] case class JDBCPartitioningInfoLong(
+    override val column: String,
+    override val columnType: DataType,
+    override val lowerBound: Long,
+    override val upperBound: Long,
+    override val numPartitions: Int)
+  extends JDBCPartitioningInfo[Long]
+
+private[sql] case class JDBCPartitioningInfoString(
+    override val column: String,
+    override val columnType: DataType,
+    override val lowerBound: String,
+    override val upperBound: String,
+    override val numPartitions: Int)
+  extends JDBCPartitioningInfo[String]
+
+private[sql] case class JDBCPartitioningInfoPseudo(
+    override val column: String,
+    override val columnType: DataType,
+    override val lowerBound: String,
+    override val upperBound: String,
+    override val numPartitions: Int)
+  extends JDBCPartitioningInfo[String]
 
 private[sql] object JDBCRelation extends Logging {
   /**
@@ -64,8 +92,11 @@ private[sql] object JDBCRelation extends Logging {
       schema: StructType,
       resolver: Resolver,
       timeZoneId: String,
-      jdbcOptions: JDBCOptions): Array[Partition] = {
-    val partitioning = {
+      jdbcOptions: JDBCOptions,
+      jdbcPartitionInfo: Option[JDBCPartitioningInfo[_]] = None): Array[Partition] = {
+    // if jdbcPartitionInfo set when useParallel option is set. find required values
+    // otherwise, using option values
+    val partitioning = jdbcPartitionInfo.getOrElse({
       import JDBCOptions._
 
       val partitionColumn = jdbcOptions.partitionColumn
@@ -85,29 +116,55 @@ private[sql] object JDBCRelation extends Logging {
         val (column, columnType) = verifyAndGetNormalizedPartitionColumn(
           schema, partitionColumn.get, resolver, jdbcOptions)
 
-        val lowerBoundValue = toInternalBoundValue(lowerBound.get, columnType, timeZoneId)
-        val upperBoundValue = toInternalBoundValue(upperBound.get, columnType, timeZoneId)
-        JDBCPartitioningInfo(
-          column, columnType, lowerBoundValue, upperBoundValue, numPartitions.get)
+        columnType match {
+          case _: StringType =>
+            val lowerBoundValue = lowerBound.get
+            val upperBoundValue = upperBound.get
+            JDBCPartitioningInfoString(
+              column, columnType, lowerBoundValue, upperBoundValue, numPartitions.get)
+          case _: NumericType | DateType | TimestampType =>
+            val lowerBoundValue = toInternalBoundValue(lowerBound.get, columnType, timeZoneId)
+            val upperBoundValue = toInternalBoundValue(upperBound.get, columnType, timeZoneId)
+            JDBCPartitioningInfoLong(
+              column, columnType, lowerBoundValue, upperBoundValue, numPartitions.get)
+          case _ =>
+            null
+        }
       }
-    }
+    })
 
     if (partitioning == null || partitioning.numPartitions <= 1 ||
       partitioning.lowerBound == partitioning.upperBound) {
       return Array[Partition](JDBCPartition(null, 0))
     }
 
+    partitioning match {
+      case infoLong: JDBCPartitioningInfoLong =>
+        getPartitionWhereClause(infoLong, timeZoneId, jdbcOptions)
+      case infoString: JDBCPartitioningInfoString =>
+        getPartitionWhereClause(infoString)
+      case infoPseudo: JDBCPartitioningInfoPseudo =>
+        getPartitionWhereClause(infoPseudo, jdbcOptions)
+      case _ =>
+        Array[Partition](JDBCPartition(null, 0))
+    }
+  }
+
+  def getPartitionWhereClause(
+      partitioning: JDBCPartitioningInfoLong,
+      timeZoneId: String,
+      jdbcOptions: JDBCOptions): Array[Partition] = {
     val lowerBound = partitioning.lowerBound
     val upperBound = partitioning.upperBound
     require (lowerBound <= upperBound,
       "Operation not allowed: the lower bound of partitioning column is larger than the upper " +
-      s"bound. Lower bound: $lowerBound; Upper bound: $upperBound")
+        s"bound. Lower bound: $lowerBound; Upper bound: $upperBound")
 
     val boundValueToString: Long => String =
       toBoundValueInWhereClause(_, partitioning.columnType, timeZoneId)
     val numPartitions =
       if ((upperBound - lowerBound) >= partitioning.numPartitions || /* check for overflow */
-          (upperBound - lowerBound) < 0) {
+        (upperBound - lowerBound) < 0) {
         partitioning.numPartitions
       } else {
         logWarning("The number of partitions is reduced because the specified number of " +
@@ -120,7 +177,88 @@ private[sql] object JDBCRelation extends Logging {
       }
     // Overflow and silliness can happen if you subtract then divide.
     // Here we get a little roundoff, but that's (hopefully) OK.
-    val stride: Long = upperBound / numPartitions - lowerBound / numPartitions
+
+    if (jdbcOptions.optimizePartition) {
+      val partList = JdbcUtils.getSampleRowsAndPartition(
+        partitioning.column, jdbcOptions, numPartitions)
+      val ans = new ArrayBuffer[Partition]()
+      val column = partitioning.column
+
+      var i: Int = 0
+      while (i < partList.length) {
+        if (i == 0) {
+          ans += JDBCPartition(s"$column < ${partList(i)} or is null", i)
+        } else {
+          ans += JDBCPartition(s"$column < ${partList(i)} AND $column >= ${partList(i - 1)}", i)
+        }
+
+        if (i == partList.length - 1) {
+          ans += JDBCPartition(s"$column >= ${partList(i)}", i)
+
+          i += 1
+        }
+      }
+      val partitions = ans.toArray
+      logInfo(s"Number of partitions: $numPartitions, WHERE clauses of these partitions: " +
+        partitions.map(_.asInstanceOf[JDBCPartition].whereClause).mkString(", "))
+      partitions
+    } else {
+      val stride: Long = upperBound / numPartitions - lowerBound / numPartitions
+
+      var i: Int = 0
+      val column = partitioning.column
+      var currentValue = lowerBound
+      val ans = new ArrayBuffer[Partition]()
+      while (i < numPartitions) {
+        val lBoundValue = boundValueToString(currentValue)
+        val lBound = if (i != 0) s"$column >= $lBoundValue" else null
+        currentValue += stride
+        val uBoundValue = boundValueToString(currentValue)
+        val uBound = if (i != numPartitions - 1) s"$column < $uBoundValue" else null
+        val whereClause =
+          if (uBound == null) {
+            lBound
+          } else if (lBound == null) {
+            s"$uBound or $column is null"
+          } else {
+            s"$lBound AND $uBound"
+          }
+        ans += JDBCPartition(whereClause, i)
+        i = i + 1
+      }
+      val partitions = ans.toArray
+      logInfo(s"Number of partitions: $numPartitions, WHERE clauses of these partitions: " +
+        partitions.map(_.asInstanceOf[JDBCPartition].whereClause).mkString(", "))
+      partitions
+    }
+  }
+
+  /**
+   * DI Custom, make where clause for each partition with string type column
+   * using Apache Sqoop's idea of org.apache.sqoop.mapreduce.db.TextSplitter
+   * @param partitioning JDBCPartitioningInfo has column of string type
+   * @return an array of partitions with where clause for each partition using string
+   */
+  def getPartitionWhereClause(
+      partitioning: JDBCPartitioningInfoString): Array[Partition] = {
+    val lowerString = partitioning.lowerBound
+    val upperString = partitioning.upperBound
+
+    val sharedLen = getCommonPrefixLen(lowerString, upperString)
+    val commonPrefix = lowerString.substring(0, sharedLen)
+    val lowerBound = stringToBigDecimal(lowerString.substring(sharedLen))
+    val upperBound = stringToBigDecimal(upperString.substring(sharedLen))
+    require (lowerBound <= upperBound,
+      "Operation not allowed: the lower bound of partitioning column is larger than the upper " +
+        s"bound. Lower bound: $lowerBound; Upper bound: $upperBound")
+
+    val boundValueToString: BigDecimal => String = bigDec => {
+      commonPrefix + bigDecimalToString(bigDec)
+    }
+
+    val numPartitions = partitioning.numPartitions
+
+    val stride: BigDecimal = tryDivide(upperBound - lowerBound, numPartitions)
 
     var i: Int = 0
     val column = partitioning.column
@@ -128,10 +266,10 @@ private[sql] object JDBCRelation extends Logging {
     val ans = new ArrayBuffer[Partition]()
     while (i < numPartitions) {
       val lBoundValue = boundValueToString(currentValue)
-      val lBound = if (i != 0) s"$column >= $lBoundValue" else null
+      val lBound = if (i != 0) s"$column >= '$lBoundValue'" else null
       currentValue += stride
       val uBoundValue = boundValueToString(currentValue)
-      val uBound = if (i != numPartitions - 1) s"$column < $uBoundValue" else null
+      val uBound = if (i != numPartitions - 1) s"$column < '$uBoundValue'" else null
       val whereClause =
         if (uBound == null) {
           lBound
@@ -149,6 +287,109 @@ private[sql] object JDBCRelation extends Logging {
     partitions
   }
 
+  /**
+   * DataStreams DI Team custom spark.
+   * In DBMS partition read use PseudoColumn.
+   * This can be support all of the case table.
+   * @param partitioning JDBCPartitioningInfo has pseudo column
+   * @param jdbcOptions JDBC options that contains url
+   * @return an array of partitions with where clause for each partition
+   */
+  def getPartitionWhereClause(
+      partitioning: JDBCPartitioningInfoPseudo,
+      jdbcOptions: JDBCOptions): Array[Partition] = {
+    val dialect = JdbcDialects.get(jdbcOptions.url)
+    val ans = new ArrayBuffer[Partition]()
+
+    val numPartitions = partitioning.numPartitions
+    val lowerBound = partitioning.lowerBound
+    val upperBound = partitioning.upperBound
+
+    var i: Int = 0
+    while (i < numPartitions) {
+      val whereClause = dialect.getPseudoColumnWhereClause(lowerBound, upperBound, numPartitions, i)
+      ans += JDBCPartition(whereClause, i)
+      i = i + 1
+    }
+
+    val partitions = ans.toArray
+    logInfo(s"Number of partitions: $numPartitions, WHERE clauses of these partitions: " +
+      partitions.map(_.asInstanceOf[JDBCPartition].whereClause).mkString(", "))
+    partitions
+  }
+
+  def autoColumnPartition(
+      schema: StructType,
+      resolver: Resolver,
+      timeZoneId: String,
+      jdbcOptions: JDBCOptions): Array[Partition] = {
+    val dialect = JdbcDialects.get(jdbcOptions.url)
+    val conn = JdbcUtils.createConnectionFactory(jdbcOptions)()
+
+    // find partition column
+    val partitionColumn = dialect.supportedPseudoColumn()
+      .orElse(findProperPartitionColumn(conn))
+      .getOrElse({
+        logWarning("Fail to find proper partition column. Using single execution")
+        return Array[Partition](JDBCPartition(null, 0))
+      })
+
+    val (lowerBound, upperBound) = JdbcUtils.getMinMaxValues(conn, partitionColumn, jdbcOptions)
+    val numPartitions = getNumPartitions()
+
+    val partitioning = if (dialect.supportedPseudoColumn().nonEmpty) {
+      Some(JDBCPartitioningInfoPseudo(partitionColumn, null, lowerBound, upperBound, numPartitions))
+    } else {
+      val (column, columnType) = verifyAndGetNormalizedPartitionColumn(
+        schema, partitionColumn, resolver, jdbcOptions)
+
+      columnType match {
+        case _: StringType =>
+          val lowerBoundValue = lowerBound
+          val upperBoundValue = upperBound
+          Some(JDBCPartitioningInfoString(
+            column, columnType, lowerBoundValue, upperBoundValue, numPartitions))
+        case _: NumericType | DateType | TimestampType =>
+          val lowerBoundValue = toInternalBoundValue(lowerBound, columnType, timeZoneId)
+          val upperBoundValue = toInternalBoundValue(upperBound, columnType, timeZoneId)
+          Some(JDBCPartitioningInfoLong(
+            column, columnType, lowerBoundValue, upperBoundValue, numPartitions))
+        case _ =>
+          null
+      }
+    }
+
+    columnPartition(schema, resolver, timeZoneId, jdbcOptions, partitioning)
+  }
+
+
+  private def findProperPartitionColumn(conn: Connection): Option[String] = {
+    // 1. use pk with high cardinality
+    // 2. is not, use high cardinality column
+
+
+    None
+  }
+
+  /**
+   * calculate proper partition number, this is not proper.
+   * Must have change to more efficient way
+   * @return proper partition number
+   */
+  private def getNumPartitions(): Int = {
+    // todo: change algorithm get more proper partition number
+    try {
+      val spark = SparkSession.getActiveSession.get
+      val core = spark.conf.get("spark.executor.cores").toInt
+      val instance = spark.conf.get("spark.executor.instances").toInt
+
+      core*instance
+    } catch {
+      case _: Exception =>
+        20
+    }
+  }
+
   // Verify column name and type based on the JDBC resolved schema
   private def verifyAndGetNormalizedPartitionColumn(
       schema: StructType,
@@ -164,12 +405,12 @@ private[sql] object JDBCRelation extends Logging {
         s"found in the JDBC relation: ${schema.simpleString(maxNumToStringFields)}")
     }
     column.dataType match {
-      case _: NumericType | DateType | TimestampType =>
+      case _: NumericType | DateType | TimestampType | StringType =>
       case _ =>
         throw new AnalysisException(
           s"Partition column type should be ${NumericType.simpleString}, " +
-            s"${DateType.catalogString}, or ${TimestampType.catalogString}, but " +
-            s"${column.dataType.catalogString} found.")
+            s"${DateType.catalogString}, or ${TimestampType.catalogString}," +
+            s"or ${TimestampType.catalogString}, but ${column.dataType.catalogString} found.")
     }
     (dialect.quoteIdentifier(column.name), column.dataType)
   }
