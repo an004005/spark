@@ -28,7 +28,6 @@ import org.apache.spark.sql.{AnalysisException, DataFrame, Row, SaveMode, SparkS
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.util.{DateFormatter, DateTimeUtils, TimestampFormatter}
 import org.apache.spark.sql.catalyst.util.DateTimeUtils.{getZoneId, stringToDate, stringToTimestamp}
-import org.apache.spark.sql.catalyst.util.StringUtils.{bigDecimalToString, getCommonPrefixLen, stringToBigDecimal, tryDivide}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.jdbc.JdbcDialects
 import org.apache.spark.sql.sources._
@@ -244,21 +243,21 @@ private[sql] object JDBCRelation extends Logging {
     val lowerString = partitioning.lowerBound
     val upperString = partitioning.upperBound
 
-    val sharedLen = getCommonPrefixLen(lowerString, upperString)
+    val sharedLen = JdbcUtils.getCommonPrefixLen(lowerString, upperString)
     val commonPrefix = lowerString.substring(0, sharedLen)
-    val lowerBound = stringToBigDecimal(lowerString.substring(sharedLen))
-    val upperBound = stringToBigDecimal(upperString.substring(sharedLen))
+    val lowerBound = JdbcUtils.stringToBigDecimal(lowerString.substring(sharedLen))
+    val upperBound = JdbcUtils.stringToBigDecimal(upperString.substring(sharedLen))
     require (lowerBound <= upperBound,
       "Operation not allowed: the lower bound of partitioning column is larger than the upper " +
         s"bound. Lower bound: $lowerBound; Upper bound: $upperBound")
 
     val boundValueToString: BigDecimal => String = bigDec => {
-      commonPrefix + bigDecimalToString(bigDec)
+      commonPrefix + JdbcUtils.bigDecimalToString(bigDec)
     }
 
     val numPartitions = partitioning.numPartitions
 
-    val stride: BigDecimal = tryDivide(upperBound - lowerBound, numPartitions)
+    val stride: BigDecimal = JdbcUtils.tryDivide(upperBound - lowerBound, numPartitions)
 
     var i: Int = 0
     val column = partitioning.column

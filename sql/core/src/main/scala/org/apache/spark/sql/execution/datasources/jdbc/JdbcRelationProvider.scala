@@ -17,7 +17,6 @@
 
 package org.apache.spark.sql.execution.datasources.jdbc
 
-import org.apache.spark.Partition
 import org.apache.spark.sql.{AnalysisException, DataFrame, SaveMode, SQLContext}
 import org.apache.spark.sql.execution.datasources.jdbc.JdbcUtils._
 import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider, DataSourceRegister, RelationProvider}
