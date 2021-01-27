@@ -287,6 +287,23 @@ abstract class JdbcDialect extends Serializable with Logging{
   def classifyException(message: String, e: Throwable): AnalysisException = {
     new AnalysisException(message, cause = Some(e))
   }
+
+  def supportedPseudoColumn(): Option[String] = None
+
+  def getMinMaxQuery(table: String, column: String): String = {
+    // Use subquery input form `( subquery )`
+    s"SELECT MIN($column), MAX($column) FROM $table"
+  }
+
+  def getPseudoColumnWhereClause(
+      lowerBound: String,
+      upperBound: String,
+      numPartitions: Int,
+      partitionIndex: Int): String = ""
+
+  def getUniformRandomLimitQuery(table: String, column: String, limit: Long): String = {
+    s"SELECT $column FROM $table ORDER BY random() LIMIT $limit"
+  }
 }
 
 /**

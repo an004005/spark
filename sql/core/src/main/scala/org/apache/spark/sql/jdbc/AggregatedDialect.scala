@@ -76,4 +76,16 @@ private class AggregatedDialect(dialects: List[JdbcDialect]) extends JdbcDialect
       cascade: Option[Boolean] = isCascadingTruncateTable): String = {
     dialects.head.getTruncateQuery(table, cascade)
   }
+
+  override def getMinMaxQuery(table: String, column: String): String = {
+    dialects.head.getMinMaxQuery(table, column)
+  }
+
+  override def getPseudoColumnWhereClause(
+      lowerBound: String,
+      upperBound: String,
+      numPartitions: Int,
+      partitionIndex: Int): String = {
+    dialects.head.getPseudoColumnWhereClause(lowerBound, upperBound, numPartitions, partitionIndex)
+  }
 }

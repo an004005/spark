@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.catalyst.util
 
+import java.math.MathContext
 import java.util.regex.{Pattern, PatternSyntaxException}
 
 import scala.collection.mutable.ArrayBuffer
@@ -97,6 +98,88 @@ object StringUtils extends Logging {
       }
     }
     funcNames.toSeq
+  }
+
+  def ONE_PLACE: BigDecimal = BigDecimal(65536, MathContext.UNLIMITED)
+
+  // Maximum number of characters to convert. This is to prevent rounding
+  // errors or repeating fractions near the very bottom from getting out of
+  // control. Note that this still gives us a huge number of possible splits.
+  def MAX_CHARS: Int = 8
+
+  def tryDivide(numerator: BigDecimal, denominator: BigDecimal): BigDecimal = {
+    val jDecimal = {
+      try {
+        numerator.underlying().divide(denominator.underlying())
+      } catch {
+        case _: ArithmeticException =>
+          numerator.underlying().divide(denominator.underlying(),
+            java.math.BigDecimal.ROUND_UP)
+      }
+    }
+    BigDecimal(jDecimal.toPlainString, MathContext.UNLIMITED)
+  }
+
+  /**
+   * Return a BigDecimal representation of string 'str' suitable for use in a
+   * numerically-sorting order.
+   */
+  def stringToBigDecimal(s: String): BigDecimal = {
+    var curPlace = ONE_PLACE
+    var result: BigDecimal = BigDecimal(0, MathContext.UNLIMITED)
+    val len: Int = Math.min(s.length, MAX_CHARS)
+    var i = 0
+
+    while (i < len) {
+      val codePoint = s.codePointAt(i)
+      result = result + tryDivide(BigDecimal(codePoint, MathContext.UNLIMITED), curPlace)
+      curPlace = curPlace * ONE_PLACE
+      i += 1
+    }
+    result
+  }
+
+  /**
+   * Return the string encoded in a BigDecimal.
+   * Repeatedly multiply the input value by 65536; the integer portion after
+   * such a multiplication represents a single character in base 65536.
+   * Convert that back into a char and create a string out of these until we
+   * have no data left.
+   */
+  def bigDecimalToString(bd: BigDecimal): String = {
+    var cur = BigDecimal(bd.underlying().stripTrailingZeros().toString,
+      MathContext.UNLIMITED)
+    val sb = new StringBuilder()
+    var i = 0
+
+    while (i < MAX_CHARS) {
+      cur = cur * ONE_PLACE
+      val curCodePoint = cur.intValue
+      if (0 == curCodePoint) return sb.toString()
+      cur = cur - curCodePoint
+      sb ++= Character.toChars(curCodePoint)
+      i += 1
+    }
+    sb.toString()
+  }
+
+  /**
+   * return common prefix of parameter string "lower" and "upper"
+   */
+  def getCommonPrefixLen(lower: String, upper: String): Int = {
+    val maxPrefixLen = Math.min(lower.length, upper.length)
+    var sharedLen = 0
+
+    while (sharedLen < maxPrefixLen) {
+      val c1 = lower.charAt(sharedLen)
+      val c2 = upper.charAt(sharedLen)
+      if (c1 != c2) {
+        return sharedLen
+      }
+      sharedLen += 1
+    }
+
+    sharedLen
   }
 
   /**

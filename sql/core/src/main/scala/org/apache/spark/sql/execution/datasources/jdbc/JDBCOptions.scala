@@ -207,7 +207,10 @@ class JDBCOptions(
   // The principal name of user's keytab file
   val principal = parameters.getOrElse(JDBC_PRINCIPAL, null)
 
+  val useParallel = parameters.getOrElse(JDBC_USE_PARALLEL, "false").toBoolean
   val tableComment = parameters.getOrElse(JDBC_TABLE_COMMENT, "").toString
+
+  val optimizePartition = parameters.getOrElse(JDBC_OPTIMIZE_PARTITION, "false").toBoolean
 }
 
 class JdbcOptionsInWrite(
@@ -263,4 +266,7 @@ object JDBCOptions {
   val JDBC_KEYTAB = newOption("keytab")
   val JDBC_PRINCIPAL = newOption("principal")
   val JDBC_TABLE_COMMENT = newOption("tableComment")
+
+  val JDBC_USE_PARALLEL = newOption("useParallel")
+  val JDBC_OPTIMIZE_PARTITION = newOption("optimizePartition")
 }

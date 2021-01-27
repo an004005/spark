@@ -21,6 +21,7 @@ import java.sql.{Connection, Driver, JDBCType, PreparedStatement, ResultSet, Res
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
 import scala.util.Try
 import scala.util.control.NonFatal
 
@@ -1005,6 +1006,130 @@ object JdbcUtils extends Logging {
     try {
       statement.setQueryTimeout(options.queryTimeout)
       statement.executeUpdate(sql)
+    } finally {
+      statement.close()
+    }
+  }
+
+  def getMinMaxValues(
+       conn: Connection,
+       column: String,
+       options: JDBCOptions): (String, String) = {
+    val dialect = JdbcDialects.get(options.url)
+    val table = options.tableOrQuery
+    val sql = dialect.getMinMaxQuery(table, column)
+
+    val statement = conn.createStatement
+    try {
+      statement.setQueryTimeout(options.queryTimeout)
+      val result = statement.executeQuery(sql)
+      result.next()
+      val min = result.getString(1)
+      val max = result.getString(2)
+      result.close()
+      (min, max)
+    } catch {
+      case e: SQLException =>
+        logError(s"Fail to get Min, Max of $column.")
+        throw e
+    } finally {
+      statement.close()
+    }
+  }
+
+  def getHighCardinalityColumnWithPrimaryKey(
+      conn: Connection,
+      options: JDBCOptions): Option[String] = {
+    // if table is query, cannot find pk
+    val dialect = JdbcDialects.get(options.url)
+    val table = options.tableOrQuery
+    val colList = ArrayBuffer[String]()
+    val statement = conn.createStatement()
+
+    val meta = conn.getMetaData
+    val PrimaryKeyRs = meta.getPrimaryKeys(null, null, table)
+
+    while (PrimaryKeyRs.next()) {
+      colList += PrimaryKeyRs.getString("COLUMN_NAME")
+    }
+
+    if (colList.length == 1) {
+      return Some(colList(0))
+    }
+
+    try {
+      if (colList.isEmpty) {
+        // this table doesn't have pk, compare all columns
+        val rs = statement
+          .executeQuery(dialect.getSchemaQuery(table))
+        val rsmd = rs.getMetaData
+        val colCount = rsmd.getColumnCount
+        for (i <- 1 to colCount) {
+          colList += rsmd.getColumnName(i)
+        }
+      }
+
+      val cardinalityCountQuery = colList
+        .map(s => s"COUNT(distinct($s)) as $s")
+        .mkString(", ")
+
+      val rs = statement
+        .executeQuery(s"SELECT $cardinalityCountQuery FROM $table")
+      val rsmd = rs.getMetaData
+      val colCount = rsmd.getColumnCount
+      var maxCardinality = 0
+      var maxCardinalityIndex = 0
+      rs.next()
+
+      for (i <- 1 to colCount) {
+        if (maxCardinality < rs.getInt(i)) {
+          maxCardinalityIndex = i - 1
+          maxCardinality = rs.getInt(i)
+        }
+      }
+
+      Some(colList(maxCardinalityIndex))
+    } finally {
+      statement.close()
+    }
+  }
+
+  def getSampleRowsAndPartition[T](
+      column: String,
+      options: JDBCOptions,
+      numPartitions: Long,
+      lowerBound: T,
+      getter: ResultSet => T)
+      (implicit num: Numeric[T]): ListBuffer[T] = {
+    import num._
+
+    val conn = createConnectionFactory(options)()
+    val dialect = JdbcDialects.get(options.url)
+
+    val table = options.tableOrQuery
+    val partList = ListBuffer[T](lowerBound)
+    val samples = ListBuffer[T]()
+    val strides = ListBuffer[T]()
+    val statement = conn.createStatement
+    try {
+      val limit = numPartitions * 1000
+      val result = statement.executeQuery(
+        dialect.getUniformRandomLimitQuery(table, column, limit))
+      while (result.next()) {
+        samples += getter(result)
+      }
+      var cnt = 0
+
+      samples.sorted.foreach(sample => {
+        cnt += 1
+        if (cnt >= 1000) {
+          partList += sample
+          strides += partList.last - partList.takeRight(2).head
+          cnt = 0
+        }
+      })
+
+      strides
     } finally {
       statement.close()
     }
